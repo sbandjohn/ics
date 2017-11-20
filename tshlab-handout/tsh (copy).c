@@ -181,14 +181,6 @@ main(int argc, char **argv)
     exit(0); /* control never reaches here */
 }
 
-pid_t Fork(void){
-	pid_t pid;
-
-	if ( (pid = fork()) < 0)
-		unix_error("Fork error");
-	return pid;
-}
-
 /* 
  * eval - Evaluate the command line that the user has just typed in
  * 
@@ -203,50 +195,18 @@ pid_t Fork(void){
 void 
 eval(char *cmdline) 
 {
-	pid_t pid;
     int bg;              /* should the job run in bg or fg? */
     struct cmdline_tokens tok;
-	sigset_t mask_all, mask_one, prev_one;
 
     /* Parse command line */
-    bg = parseline(cmdline, &tok);
+    bg = parseline(cmdline, &tok); 
 
     if (bg == -1) /* parsing error */
         return;
     if (tok.argv[0] == NULL) /* ignore empty lines */
         return;
 
-	if (tok.builtins == BUILTIN_QUIT)
-		exit(0);
-
-	if (tok.builtins == BUILTIN_JOBS)
-		listjobs(job_list, STDOUT_FILENO);
-
-	if (tok.builtins == BUILTIN_NONE){
-		sigfillset(&mask_all);
-		sigemptyset(&mask_one);
-		sigaddset(&mask_one, SIGCHLD);
-		sigprocmask(SIG_BLOCK, &mask_one, &prev_one);
-		if (!bg){
-			if ( (pid = Fork()) == 0){
-				sigprocmask(SIG_SETMASK, &prev_one, NULL);
-				execve(tok.argv[0], tok.argv, environ);
-			}
-		}
-		sigprocmask(SIG_BLOCK, &mask_all, NULL);
-		addjob(job_list, pid, FG, cmdline);
-		sigprocmask(SIG_SETMASK, &prev_one, NULL);
-	}
-
     return;
-}
-
-void builtin_jobs(){
-	sigset_t mask_all, prev_one;
-	sigfillset(&mask_all);
-	sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
-	listjobs(job_list, STDOUT_FILENO);
-	sigprocmask(SIG_SETMASK, &prev_one, NULL);
 }
 
 /* 
@@ -412,19 +372,6 @@ parseline(const char *cmdline, struct cmdline_tokens *tok)
 void 
 sigchld_handler(int sig) 
 {
-	int olderrno = errno;
-	sigset_t mask_all, prev_one;
-	pid_t pid;
-
-	sigfillset(&mask_all);
-	while ((pid = waitpid(-1, NULL, 0)) > 0){
-		sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
-		deletejob(job_list, pid);
-		sigprocmask(SIG_BLOCK, &prev_one, NULL);
-	}
-	if (errno != ECHILD)
-		sio_error("waitpid error");	
-	errno = olderrno;
     return;
 }
 
