@@ -197,7 +197,6 @@ main(int argc, char **argv)
 /* Fork in csapp */
 pid_t Fork(void){
 	pid_t pid;
-
 	if ( (pid = fork()) < 0)
 		unix_error("Fork error");
 	return pid;
@@ -233,22 +232,23 @@ eval(char *cmdline)
 	int fin = STDIN_FILENO, fout = STDOUT_FILENO;
 	if (tok.infile){
 		if ( (fin = open(tok.infile, O_RDONLY, 0)) < 0){
-			unix_error("Cannot open input file\n");
+			printf("Error: %s No such file or directory\n", tok.infile);
 			return ;
 		}
-		dup2(fin, STDIN_FILENO);
 	}
 	if (tok.outfile){
 		if ( (fout = open(tok.outfile, O_WRONLY|O_CREAT|O_TRUNC, DEF_MODE)) < 0){
-			unix_error("Cannot open output file\n");
+			printf("Error: %s No such file or directory\n", tok.outfile);
+			if (close(fin)<0) unix_error("Cannot close input file");
 			return ;
 		}
-		dup2(fout, STDOUT_FILENO);
 	}
+	dup2(fin, STDIN_FILENO);
+	dup2(fout, STDOUT_FILENO);
 
 	/* case by case */
 	if (tok.builtins == BUILTIN_QUIT)
-		exit(0);
+		exit(0); 
 
 	if (tok.builtins == BUILTIN_JOBS)
 		builtin_jobs(tok);
@@ -257,7 +257,7 @@ eval(char *cmdline)
 		builtin_fg(tok);
 
 	if (tok.builtins == BUILTIN_BG)
-		builtn_bg(tok);
+		builtin_bg(tok);
 
 	if (tok.builtins == BUILTIN_NONE)
 		run_exe(tok, cmdline, bg);
@@ -265,41 +265,46 @@ eval(char *cmdline)
 	/* recover std I/O file descriptors */
 	if (tok.infile){
 		dup2(pre_in, STDIN_FILENO);
-		if (close(fin) < 0){
-			unix_error("Cannot close input file\n");
-			exit(0):
-		}
+		if (close(fin) < 0) unix_error("Cannot close input file\n");
 	}
 	if (tok.outfile){
 		dup2(pre_out, STDOUT_FILENO);
-		if (close(fout) < 0){
-			unix_error("Cannot close output file\n");
-			exit(0);
-		}
+		if (close(fout) < 0) unix_error("Cannot close output file\n");
 	}
 
 	return;
 }
 
-static void waipid(pid_t pid, sigset_t *prev_one){
-	if (verbose){
-		sio_puts(" start waiting fg\b");
-	}
+/*
+   Wait for process (pid) to terminate to stop
+   When a child terminates or stops,
+   it sends a SIGCHLD to be handled in sigchld_handler().
+   If the child has this pid,
+   then fg_done will be set to 1 and the loop is ended.
+   Signals should be blocked before calling this function.
+*/
+static void waitfg(pid_t pid, sigset_t *prevp){
+	if (verbose) printf(" start waiting for %d\n", pid);
 	fg_pid = pid;
 	fg_done = 0;
 	while (!fg_done)
-		sigsuspend(&prev_one);
-	if (verbose){
-		sio_puts(" stop waiting\n");
-	}
+		sigsuspend(prevp);
+	if (verbose) printf(" stop waiting for %d\n", pid);
 }
 
+/*
+   run executable program
+*/
 int run_exe(struct cmdline_tokens tok, char *cmdline, int bg){
+	/* Block all the signals to prevent races.
+	   Parent process will not be interrupted by signal sent from child */
 	sigset_t mask_all, prev_one;
 	sigfillset(&mask_all);
 	sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+	pid_t pid;
+
 	if ( (pid = Fork()) == 0){
-		/* reset the child process */
+		/* reset the child process and start running*/
 		setpgid(0,0);
 		Signal(SIGCHLD, SIG_DFL);
 		Signal(SIGINT, SIG_DFL);
@@ -308,28 +313,140 @@ int run_exe(struct cmdline_tokens tok, char *cmdline, int bg){
 		Signal(SIGTTOU, SIG_DFL);
 		Signal(SIGQUIT, SIG_DFL); 
 		sigprocmask(SIG_SETMASK, &prev_one, NULL);
-
+		
 		if (execve(tok.argv[0], tok.argv, environ) < 0){
 			printf("%s: Command not found\n", cmdline);
-			return -1;
+			exit(0);
 		}
 	}
+	/* Signals have been blocked, so addjob() is called safely */
 	addjob(job_list, pid, bg ? BG : FG, cmdline);
-	if (!bg) waitfg(pid, &prev_one);
+	if (!bg)
+		waitfg(pid, &prev_one);
+	else
+		printf("[%d] (%d) %s\n", pid2jid(pid), pid, cmdline);
+
 	sigprocmask(SIG_SETMASK, &prev_one, NULL);
+	return 0;
 }
 
+/* Convert string to int, return -1 if it fails */
+static int my_atoi(char *s){
+	int v = 0;
+	if (NULL == s) return -1;
+	for (; *s; ++s){
+		if (*s<'0' || *s>'9') return -1;
+		v = v*10 + *s-'0';
+	}
+	return v;
+}
+
+/* Extract pid or jid from the command line argument of "FG" and "BG" command,
+   and store them by pointers.
+   return 
+   0 if the job is identified by pid
+   1 if the job is identified by jid
+   -1 if fail
+*/
+static int parse_pid_jid(char *s, pid_t *pidp, int *jidp){
+	int is_jid;
+	if (NULL == s) return -1;
+	if (*s == '%'){
+		is_jid = 1;
+		if ( (*jidp = my_atoi(s+1)) < 0 ) return -1;
+	}else
+		if ( (int)(*pidp = (pid_t)my_atoi(s)) < 0 ) return -1;
+	return is_jid;
+}
+
+/*
+   Command "FG":
+   There are two cases: BG->FG, ST->FG
+   It's OK to send SIGCONT to the target process in both cases
+   and wait for it to terminate or stop.
+   return:
+   -1 if the argument is invalid
+   0 if no job is found or everything is normal.
+*/
 int builtin_fg(struct cmdline_tokens tok){
+	int is_jid, jid;
+	pid_t pid;
+	struct job_t *job;
+	if ( (is_jid = parse_pid_jid(tok.argv[1], &pid, &jid)) < 0){
+		printf("fg command requires PID or %%jobid argument\n");
+		return -1;
+	}
+
+	/* Block all the signals to prevent signal handlers accessing job_list */
+	sigset_t mask, prev;
+	sigfillset(&mask);
+	sigprocmask(SIG_BLOCK, &mask, &prev);
+
+	if (is_jid) job = getjobjid(job_list, jid);
+	else job = getjobpid(job_list, pid);
+	if (job){
+		pid = job->pid;
+		job->state = FG;
+		kill(-pid, SIGCONT);
+		waitfg(pid, &prev);
+	}else{
+		if (is_jid) printf("[%d]", jid);
+		else printf("(%d)", pid);
+		printf(": No such process\n");
+	}	
+
+	sigprocmask(SIG_SETMASK, &prev, NULL);
+	return 0;
 }
 
+/*
+   Command "BG":
+   There is only one case: ST->BG.
+   just send a SIGCONT
+   like "FG", return:
+   -1 if the argument is invalid,
+   0 if no job is found or everything is normal.
+*/
 int builtin_bg(struct cmdline_tokens tok){
+	int is_jid, jid;
+	pid_t pid;
+	struct job_t *job;
+	if ( (is_jid = parse_pid_jid(tok.argv[1], &pid, &jid)) < 0){
+		printf("bg command requires PID or %%jobid argument\n");
+		return -1;
+	}
+	
+	/* Block all the signals to prevent signal handlers accessing job_list */
+	sigset_t mask, prev;
+	sigfillset(&mask);
+	sigprocmask(SIG_BLOCK, &mask, &prev);
+
+	if (is_jid) job = getjobjid(job_list, jid);
+	else job = getjobpid(job_list, pid);
+	if (job){
+		pid = job->pid;
+		job->state = BG;
+		kill(-pid, SIGCONT);
+		printf("[%d] (%d) %s\n", job->jid, pid, job->cmdline);
+	}else{
+		if (is_jid) printf("[%d]", jid);
+		else printf("(%d)", pid);
+		printf(": No such process\n");
+	}	
+
+	sigprocmask(SIG_SETMASK, &prev, NULL);
+	return 0;
 }
 
+/*
+   Command "jobs" 
+*/
 int builtin_jobs(struct cmdline_tokens tok){
+	/* Block all the signals to prevent signal handlers accessing job_list */
 	sigset_t mask_all, prev_one;
 	sigfillset(&mask_all);
 	sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
-	listjobs(job_list, fd, STDOUT_FILENO);
+	listjobs(job_list, STDOUT_FILENO);
 	sigprocmask(SIG_SETMASK, &prev_one, NULL);
 	return 0;
 }
@@ -500,15 +617,32 @@ sigchld_handler(int sig)
 	int olderrno = errno;
 	sigset_t mask_all, prev_one;
 	pid_t pid;
+	int status;
 
 	sigfillset(&mask_all);
-	while ((pid = waitpid(-1, NULL, 0)) > 0){
+	while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0){
 		sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
-		deletejob(job_list, pid);
-		sigprocmask(SIG_BLOCK, &prev_one, NULL);
+		if (pid == fg_pid) fg_done = 1;
+		/* job exited normally */
+		if (WIFEXITED(status)){
+			deletejob(job_list, pid);
+		}
+		/* job terminated because of signal */
+		if (WIFSIGNALED(status)){
+			sprintf(sbuf, "Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, WTERMSIG(status));
+			sio_puts(sbuf);
+			deletejob(job_list, pid);
+		}
+		/* job stopped */
+		if (WIFSTOPPED(status)){
+			sprintf(sbuf, "Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, WSTOPSIG(status));
+			sio_puts(sbuf);
+			struct job_t *job = getjobpid(job_list, pid);
+			job->state = ST;
+		}
+
+		sigprocmask(SIG_SETMASK, &prev_one, NULL);
 	}
-	if (errno != ECHILD)
-		sio_error("waitpid error");	
 	errno = olderrno;
     return;
 }
@@ -519,8 +653,21 @@ sigchld_handler(int sig)
  *    to the foreground job.  
  */
 void 
-sigint_handler(int sig) 
-{
+sigint_handler(int sig){
+	int old = errno;
+	sigset_t mask_all, prev;
+	sigprocmask(SIG_BLOCK, &mask_all, &prev);
+	pid_t pid = fgpid(job_list);
+	if (pid){
+		kill(-pid, SIGINT);
+		if (verbose){
+			sio_puts("sigint_handler: send a SIGINT to ");
+			sio_putl(pid);
+			sio_puts("\n");
+		}
+	}
+	sigprocmask(SIG_SETMASK, &prev, NULL);
+	errno = old;
     return;
 }
 
@@ -530,8 +677,21 @@ sigint_handler(int sig)
  *     foreground job by sending it a SIGTSTP.  
  */
 void 
-sigtstp_handler(int sig) 
-{
+sigtstp_handler(int sig){
+	int old = errno;
+	sigset_t mask_all, prev;
+	sigprocmask(SIG_BLOCK, &mask_all, &prev);
+	pid_t pid = fgpid(job_list);
+	if (pid){
+		kill(-pid, SIGTSTP);
+		if (verbose){
+			sio_puts("sigint_handler: send a SIGTSTP to ");
+			sio_putl(pid);
+			sio_puts("\n");
+		}
+	}
+	sigprocmask(SIG_SETMASK, &prev, NULL);
+	errno = old;
     return;
 }
 
