@@ -315,7 +315,7 @@ int run_exe(struct cmdline_tokens tok, char *cmdline, int bg){
 		}
 	}
 	addjob(job_list, pid, bg ? BG : FG, cmdline);
-	if (!bg) waitfg(pid, &prev_one);
+	if (!bg) waitfg(pid, &pre_one);
 	sigprocmask(SIG_SETMASK, &prev_one, NULL);
 }
 
