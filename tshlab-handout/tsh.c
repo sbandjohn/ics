@@ -195,12 +195,53 @@ main(int argc, char **argv)
 }
 
 /* Fork in csapp */
-pid_t Fork(void){
+static pid_t Fork(void){
 	pid_t pid;
 	if ( (pid = fork()) < 0)
 		unix_error("Fork error");
 	return pid;
 }
+
+/* kill wrapper */
+static int Kill(pid_t pid, int sig){
+	if (kill(pid, sig) < 0)
+		unix_error("Kill error");
+	return 0;
+}
+
+/* dup2 wrapper */
+static int Dup2(int a, int b){
+	if (dup2(a,b) < 0)
+		unix_error("Dup2 error");
+	return 0;
+}
+
+/* close wrapper */
+static int Close(int a){
+	if (close(a) < 0)
+		unix_error("Close error");
+	return 0;
+}
+
+/* other wrappers */
+static int Sigprocmask(int how, const sigset_t *set, sigset_t *old){
+	if (sigprocmask(how, set, old) < 0)
+		unix_error("Sigprocmask error");
+	return 0;
+}
+
+static int Sigemptyset(sigset_t *set){
+	if (sigemptyset(set) < 0)
+		unix_error("Sigemptyset error");
+	return 0;
+}
+
+static int Sigfillset(sigset_t *set){
+	if (sigfillset(set) < 0)
+		unix_error("Sigfillset error");
+	return 0;
+}
+
 
 /* 
  * eval - Evaluate the command line that the user has just typed in
@@ -230,25 +271,29 @@ eval(char *cmdline)
 	/* I/O redirection */
 	/* save original file */
 	int pre_in = dup(STDIN_FILENO), pre_out = dup(STDOUT_FILENO);
-	if (pre_in == -1 || pre_out == -1) unix_error("Error: dup");
+	if (pre_in == -1 || pre_out == -1) unix_error("dup error");
 
 	int fin = STDIN_FILENO, fout = STDOUT_FILENO;
 	if (tok.infile){
-		if ( (fin = open(tok.infile, O_RDONLY, 0)) < 0){
-			fprintf(stderr, "Error: %s No such file or directory\n", tok.infile);
+		fin = open(tok.infile, O_RDONLY, 0);
+		if (fin < 0){
+			fprintf(stderr, "Error: %s No such file or directory\n",
+					tok.infile);
 			return ;
 		}
 	}
 	if (tok.outfile){
-		if ( (fout = open(tok.outfile, O_WRONLY|O_CREAT|O_TRUNC, DEF_MODE)) < 0){
-			fprintf(stderr, "Error: %s No such file or directory\n", tok.outfile);
+		fout = open(tok.outfile, O_WRONLY|O_CREAT|O_TRUNC, DEF_MODE);
+		if (fout < 0){
+			fprintf(stderr, "Error: %s No such file or directory\n",
+					tok.outfile);
 			/* close opened input file before return */
-			if (tok.infile && close(fin)<0) unix_error("Cannot close input file");
+			if (tok.infile) Close(fin);
 			return ;
 		}
 	}
-	if (dup2(fin, STDIN_FILENO) < 0) unix_error("Error: dup2 of input file");
-	if (dup2(fout, STDOUT_FILENO) < 0) unix_error("Error: dup2 of output file");
+	Dup2(fin, STDIN_FILENO);
+	Dup2(fout, STDOUT_FILENO);
 
 	/* case by case */
 	if (tok.builtins == BUILTIN_QUIT)
@@ -268,12 +313,12 @@ eval(char *cmdline)
 	
 	/* recover std I/O file descriptors */
 	if (tok.infile){
-		if (dup2(pre_in, STDIN_FILENO) < 0) unix_error("Error: dup2 of input file");
-		if (close(fin) < 0) unix_error("Cannot close input file\n");
+		Dup2(pre_in, STDIN_FILENO);
+		Close(fin);
 	}
 	if (tok.outfile){
-		if (dup2(pre_out, STDOUT_FILENO) < 0) unix_error("Error: dup2 of output file");
-		if (close(fout) < 0) unix_error("Cannot close output file\n");
+		Dup2(pre_out, STDOUT_FILENO);
+		Close(fout);
 	}
 
 	return;
@@ -305,20 +350,20 @@ int run_exe(struct cmdline_tokens tok, char *cmdline, int bg){
 	/* Block all the signals to prevent races.
 	   Parent process will not be interrupted by signal sent from child */
 	sigset_t mask_all, prev_one;
-	sigfillset(&mask_all);
-	sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+	Sigfillset(&mask_all);
+	Sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
 	
 	pid_t pid;
 	if ( (pid = Fork()) == 0){
 		/* reset the child process and start running*/
-		setpgid(0,0);
+		if (setpgid(0,0) < 0) unix_error("setpgid error");
 		Signal(SIGCHLD, SIG_DFL);
 		Signal(SIGINT, SIG_DFL);
 		Signal(SIGTSTP, SIG_DFL);
 		Signal(SIGTTIN, SIG_DFL);
 		Signal(SIGTTOU, SIG_DFL);
 		Signal(SIGQUIT, SIG_DFL); 
-		sigprocmask(SIG_SETMASK, &prev_one, NULL);
+		Sigprocmask(SIG_SETMASK, &prev_one, NULL);
 		
 		if (execve(tok.argv[0], tok.argv, environ) < 0){
 			fprintf(stderr, "%s: Command not found\n", cmdline);
@@ -334,7 +379,7 @@ int run_exe(struct cmdline_tokens tok, char *cmdline, int bg){
 		printf("[%d] (%d) %s\n", pid2jid(pid), pid, cmdline);
 
 	/* Unblock signals */
-	sigprocmask(SIG_SETMASK, &prev_one, NULL);
+	Sigprocmask(SIG_SETMASK, &prev_one, NULL);
 	return 0;
 }
 
@@ -349,7 +394,8 @@ static int my_atoi(char *s){
 	return v;
 }
 
-/* Extract pid or jid from the command line argument of "FG" and "BG" command,
+/* Extract pid or jid from the command line argument 
+   of "FG" and "BG" command,
    and store them by pointers.
    return 
    0 if the job is identified by pid
@@ -389,16 +435,17 @@ int builtin_fg(struct cmdline_tokens tok){
 	/* Block all the signals to prevent signal handlers
 	   accessing job_list and other global var */
 	sigset_t mask, prev;
-	sigfillset(&mask);
-	sigprocmask(SIG_BLOCK, &mask, &prev);
+	Sigfillset(&mask);
+	Sigprocmask(SIG_BLOCK, &mask, &prev);
 
 	if (is_jid) job = getjobjid(job_list, jid);
 	else job = getjobpid(job_list, pid);
+
 	if (job){
 		/* set the state of foreground job and wait for it */
 		pid = job->pid;
 		job->state = FG;
-		kill(-pid, SIGCONT);
+		Kill(-pid, SIGCONT);
 		waitfg(pid, &prev);
 	}else{
 		if (is_jid) printf("[%d]", jid);
@@ -406,7 +453,7 @@ int builtin_fg(struct cmdline_tokens tok){
 		printf(": No such process\n");
 	}	
 
-	sigprocmask(SIG_SETMASK, &prev, NULL);
+	Sigprocmask(SIG_SETMASK, &prev, NULL);
 	return 0;
 }
 
@@ -430,15 +477,16 @@ int builtin_bg(struct cmdline_tokens tok){
 	/* Block all the signals to prevent signal handlers
 	   accessing job_list and other global var */
 	sigset_t mask, prev;
-	sigfillset(&mask);
-	sigprocmask(SIG_BLOCK, &mask, &prev);
+	Sigfillset(&mask);
+	Sigprocmask(SIG_BLOCK, &mask, &prev);
 
 	if (is_jid) job = getjobjid(job_list, jid);
 	else job = getjobpid(job_list, pid);
+
 	if (job){
 		pid = job->pid;
 		job->state = BG;
-		kill(-pid, SIGCONT);
+		Kill(-pid, SIGCONT);
 		printf("[%d] (%d) %s\n", job->jid, pid, job->cmdline);
 	}else{
 		if (is_jid) printf("[%d]", jid);
@@ -446,7 +494,7 @@ int builtin_bg(struct cmdline_tokens tok){
 		printf(": No such process\n");
 	}	
 
-	sigprocmask(SIG_SETMASK, &prev, NULL);
+	Sigprocmask(SIG_SETMASK, &prev, NULL);
 	return 0;
 }
 
@@ -455,14 +503,15 @@ int builtin_bg(struct cmdline_tokens tok){
    always return 0
 */
 int builtin_jobs(struct cmdline_tokens tok){
-	/* Block all the signals to prevent signal handlers accessing global var */
+	/* Block all the signals to prevent signal handlers
+	   accessing global var */
 	sigset_t mask_all, prev_one;
-	sigfillset(&mask_all);
-	sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+	Sigfillset(&mask_all);
+	Sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
 
 	listjobs(job_list, STDOUT_FILENO);
 
-	sigprocmask(SIG_SETMASK, &prev_one, NULL);
+	Sigprocmask(SIG_SETMASK, &prev_one, NULL);
 	return 0;
 }
 
@@ -634,9 +683,9 @@ sigchld_handler(int sig)
 	pid_t pid;
 	int status;
 
-	sigfillset(&mask_all);
+	Sigfillset(&mask_all);
 	while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0){
-		sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+		Sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
 
 		/* Whether foreground job is done */
 		if (pid == fg_pid) fg_done = 1;
@@ -665,7 +714,7 @@ sigchld_handler(int sig)
 			job->state = ST;
 		}
 
-		sigprocmask(SIG_SETMASK, &prev_one, NULL);
+		Sigprocmask(SIG_SETMASK, &prev_one, NULL);
 	}
 
 	errno = olderrno;
@@ -681,11 +730,11 @@ void
 sigint_handler(int sig){
 	int old = errno;
 	sigset_t mask_all, prev;
-	sigprocmask(SIG_BLOCK, &mask_all, &prev);
+	Sigprocmask(SIG_BLOCK, &mask_all, &prev);
 
 	pid_t pid = fgpid(job_list);
 	if (pid){
-		kill(-pid, SIGINT);
+		Kill(-pid, SIGINT);
 		if (verbose){
 			sio_puts("sigint_handler: send a SIGINT to ");
 			sio_putl(pid);
@@ -693,7 +742,7 @@ sigint_handler(int sig){
 		}
 	}
 
-	sigprocmask(SIG_SETMASK, &prev, NULL);
+	Sigprocmask(SIG_SETMASK, &prev, NULL);
 	errno = old;
     return;
 }
@@ -707,11 +756,11 @@ void
 sigtstp_handler(int sig){
 	int old = errno;
 	sigset_t mask_all, prev;
-	sigprocmask(SIG_BLOCK, &mask_all, &prev);
+	Sigprocmask(SIG_BLOCK, &mask_all, &prev);
 	
 	pid_t pid = fgpid(job_list);
 	if (pid){
-		kill(-pid, SIGTSTP);
+		Kill(-pid, SIGTSTP);
 		if (verbose){
 			sio_puts("sigint_handler: send a SIGTSTP to ");
 			sio_putl(pid);
@@ -719,7 +768,7 @@ sigtstp_handler(int sig){
 		}
 	}
 
-	sigprocmask(SIG_SETMASK, &prev, NULL);
+	Sigprocmask(SIG_SETMASK, &prev, NULL);
 	errno = old;
     return;
 }
@@ -1024,7 +1073,7 @@ handler_t
     struct sigaction action, old_action;
 
     action.sa_handler = handler;  
-    sigemptyset(&action.sa_mask); /* block sigs of type being handled */
+    Sigemptyset(&action.sa_mask); /* block sigs of type being handled */
     action.sa_flags = SA_RESTART; /* restart syscalls if possible */
 
     if (sigaction(signum, &action, &old_action) < 0)
